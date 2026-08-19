@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: PAT GA4 Server-Side Purchase Tracking
- * Description: Sends the GA4 "purchase" event via the Measurement Protocol directly from the server when an order completes, so ecommerce tracking no longer depends on the custom Oxygen/Breakdance checkout's thank-you page JavaScript executing. Supplements (does not replace) the official "Google Analytics for WooCommerce" plugin, which keeps handling page views, add-to-cart, etc.
- * Version: 1.0.0
+ * Description: Sends the GA4 "purchase" event via the Measurement Protocol directly from the server when an order completes, so ecommerce tracking no longer depends on the custom Oxygen/Breakdance checkout's thank-you page JavaScript executing. This is the sole purchase tracker (the official "Google Analytics for WooCommerce" plugin's "Purchase Transactions" setting is disabled to avoid double-counting) - it still handles page views, add-to-cart, add_shipping_info/add_payment_info, etc., all of which already work correctly on this site's classic checkout shortcode.
+ * Version: 1.1.0
  * Author: Price Action Tools
  * License: GPL-2.0-or-later
  * Requires Plugins: woocommerce
@@ -23,6 +23,9 @@ final class PAT_GA4_Server_Tracking {
 
 	/** Order meta key: whether the client_id came from the visitor's _ga cookie or was generated. */
 	const CLIENT_ID_SOURCE_META_KEY = '_ga4_client_id_source';
+
+	/** Order meta key: the GA4 session_id attributed to this order (empty string if unavailable at capture time). */
+	const SESSION_ID_META_KEY = '_ga4_session_id';
 
 	/** WooCommerce logger source name (see WooCommerce > Status > Logs). */
 	const LOG_SOURCE = 'ga4-server-tracking';
@@ -148,8 +151,9 @@ final class PAT_GA4_Server_Tracking {
 			return new WP_Error( 'ga4_missing_secret', $message );
 		}
 
-		$client_id = self::get_or_create_client_id( $order );
-		$payload   = self::build_payload( $order, $client_id, $tag_debug_view );
+		$client_id  = self::get_or_create_client_id( $order );
+		$session_id = self::get_session_id( $order );
+		$payload    = self::build_payload( $order, $client_id, $session_id, $tag_debug_view );
 
 		$endpoint = $validate
 			? 'https://www.google-analytics.com/debug/mp/collect'
@@ -214,9 +218,10 @@ final class PAT_GA4_Server_Tracking {
 		self::log(
 			'info',
 			sprintf(
-				'Order #%d: purchase event sent (client_id %s, value %s %s).',
+				'Order #%d: purchase event sent (client_id %s, session_id %s, value %s %s).',
 				$order->get_id(),
 				$client_id,
+				$session_id ? $session_id : '(none)',
 				$order->get_total(),
 				$order->get_currency()
 			)
@@ -230,10 +235,11 @@ final class PAT_GA4_Server_Tracking {
 	 *
 	 * @param WC_Order $order
 	 * @param string   $client_id
+	 * @param string   $session_id
 	 * @param bool     $tag_debug_view
 	 * @return array
 	 */
-	private static function build_payload( WC_Order $order, $client_id, $tag_debug_view = false ) {
+	private static function build_payload( WC_Order $order, $client_id, $session_id, $tag_debug_view = false ) {
 		$items = array();
 
 		foreach ( $order->get_items() as $item ) {
@@ -259,6 +265,15 @@ final class PAT_GA4_Server_Tracking {
 			'currency'       => $order->get_currency(),
 			'items'          => $items,
 		);
+
+		if ( $session_id ) {
+			// Ties this Measurement Protocol hit to the visitor's actual browser session.
+			// Without session_id, GA4 has no session to attach source/medium to and the
+			// purchase revenue lands under "Unassigned" / "(not set)" landing page even
+			// though client_id is valid - this was the root cause of that symptom.
+			$params['session_id']           = $session_id;
+			$params['engagement_time_msec'] = 1;
+		}
 
 		if ( $tag_debug_view ) {
 			$params['debug_mode'] = true;
@@ -297,10 +312,22 @@ final class PAT_GA4_Server_Tracking {
 		}
 
 		list( $client_id, $source ) = self::resolve_client_id();
+		$session_id                 = self::resolve_session_id();
 
 		$order->update_meta_data( self::CLIENT_ID_META_KEY, $client_id );
 		$order->update_meta_data( self::CLIENT_ID_SOURCE_META_KEY, $source );
+		$order->update_meta_data( self::SESSION_ID_META_KEY, $session_id );
 		$order->save();
+
+		if ( '' === $session_id ) {
+			self::log(
+				'warning',
+				sprintf(
+					'Order #%d: no _ga_<container-id> session cookie found at checkout; purchase event will be sent without session_id, so revenue may still land as Unassigned/(not set) even though client_id was captured.',
+					$order->get_id()
+				)
+			);
+		}
 	}
 
 	/**
@@ -334,6 +361,46 @@ final class PAT_GA4_Server_Tracking {
 		}
 
 		return $client_id;
+	}
+
+	/**
+	 * Returns the order's stored session_id, if checkout capture found one.
+	 *
+	 * Unlike client_id, no fallback is generated here: a made-up session_id
+	 * wouldn't attach to any real session and would just as effectively read
+	 * as "no session" to GA4, but without the honesty of an empty value.
+	 *
+	 * @param WC_Order $order
+	 * @return string Empty string if never captured.
+	 */
+	private static function get_session_id( WC_Order $order ) {
+		return (string) $order->get_meta( self::SESSION_ID_META_KEY );
+	}
+
+	/**
+	 * Reads session_id from the GA4 session cookie, which gtag.js sets as
+	 * _ga_<container-id> (the container ID is assigned per data stream and
+	 * isn't necessarily the measurement ID suffix, so the cookie name is
+	 * discovered by pattern rather than assumed). Cookie value format is
+	 * GS1.1.<session_id>.<session_number>.<engaged>.<timestamp>... - session_id
+	 * is the third dot-separated segment.
+	 *
+	 * @return string Empty string if no matching cookie is present.
+	 */
+	private static function resolve_session_id() {
+		foreach ( $_COOKIE as $name => $value ) {
+			if ( ! preg_match( '/^_ga_[A-Za-z0-9]+$/', $name ) ) {
+				continue;
+			}
+
+			$parts = explode( '.', sanitize_text_field( wp_unslash( $value ) ) );
+
+			if ( isset( $parts[2] ) && ctype_digit( $parts[2] ) ) {
+				return $parts[2];
+			}
+		}
+
+		return '';
 	}
 
 	/**
