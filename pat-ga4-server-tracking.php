@@ -2,7 +2,7 @@
 /**
  * Plugin Name: PAT GA4 Server-Side Purchase Tracking
  * Description: Sends the GA4 "purchase" event via the Measurement Protocol directly from the server when an order completes, so ecommerce tracking no longer depends on the custom Oxygen/Breakdance checkout's thank-you page JavaScript executing. This is the sole purchase tracker (the official "Google Analytics for WooCommerce" plugin's "Purchase Transactions" setting is disabled to avoid double-counting) - it still handles page views, add-to-cart, add_shipping_info/add_payment_info, etc., all of which already work correctly on this site's classic checkout shortcode.
- * Version: 1.1.0
+ * Version: 1.1.1
  * Author: Price Action Tools
  * License: GPL-2.0-or-later
  * Requires Plugins: woocommerce
@@ -381,9 +381,17 @@ final class PAT_GA4_Server_Tracking {
 	 * Reads session_id from the GA4 session cookie, which gtag.js sets as
 	 * _ga_<container-id> (the container ID is assigned per data stream and
 	 * isn't necessarily the measurement ID suffix, so the cookie name is
-	 * discovered by pattern rather than assumed). Cookie value format is
-	 * GS1.1.<session_id>.<session_number>.<engaged>.<timestamp>... - session_id
-	 * is the third dot-separated segment.
+	 * discovered by pattern rather than assumed).
+	 *
+	 * The third dot-separated segment of the cookie value holds the session
+	 * id, but its own format has changed across gtag.js versions:
+	 *  - GS2.x (current): "$"-delimited, letter-prefixed fields, e.g.
+	 *    "s1787168690$o4$g1$t1787168757$j54$l0$h0" - session_id is the "s" field.
+	 *  - GS1.x (older): a bare number, e.g. "1700000000".
+	 * Confirmed against a real captured cookie during live testing on
+	 * 2026-08-19 (order #4846/#4847 both had a GS2.x cookie present that the
+	 * original GS1-only parsing missed entirely, despite client_id capturing
+	 * fine from the same request).
 	 *
 	 * @return string Empty string if no matching cookie is present.
 	 */
@@ -395,7 +403,15 @@ final class PAT_GA4_Server_Tracking {
 
 			$parts = explode( '.', sanitize_text_field( wp_unslash( $value ) ) );
 
-			if ( isset( $parts[2] ) && ctype_digit( $parts[2] ) ) {
+			if ( ! isset( $parts[2] ) ) {
+				continue;
+			}
+
+			if ( preg_match( '/(?:^|\$)s(\d+)/', $parts[2], $matches ) ) {
+				return $matches[1];
+			}
+
+			if ( ctype_digit( $parts[2] ) ) {
 				return $parts[2];
 			}
 		}
