@@ -2,7 +2,7 @@
 /**
  * Plugin Name: PAT GA4 Server-Side Purchase Tracking
  * Description: Sends the GA4 "purchase" event via the Measurement Protocol directly from the server when an order completes, so ecommerce tracking no longer depends on the custom Oxygen/Breakdance checkout's thank-you page JavaScript executing. This is the sole purchase tracker (the official "Google Analytics for WooCommerce" plugin's "Purchase Transactions" setting is disabled to avoid double-counting) - it still handles page views, add-to-cart, add_shipping_info/add_payment_info, etc., all of which already work correctly on this site's classic checkout shortcode.
- * Version: 1.1.1
+ * Version: 1.2.0
  * Author: Price Action Tools
  * License: GPL-2.0-or-later
  * Requires Plugins: woocommerce
@@ -15,8 +15,29 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 final class PAT_GA4_Server_Tracking {
 
+	const VERSION = '1.2.0';
+
+	/**
+	 * Hosts allowed to send to the live /mp/collect endpoint. Anywhere else (Local,
+	 * staging, any clone of prod) is forced onto the validation endpoint, which
+	 * records nothing - so a cloned DB carrying the real secret can't pollute GA4.
+	 */
+	const PRODUCTION_HOSTS = array( 'priceactiontools.com', 'www.priceactiontools.com' );
+
 	/** Order meta key: timestamp the purchase event was successfully sent (live). Used for de-duplication. */
 	const SENT_META_KEY = '_ga4_purchase_sent';
+
+	/** Order meta key: why automatic sending was skipped for this order (internal/test order, nothing to report). */
+	const SKIPPED_META_KEY = '_ga4_purchase_skipped';
+
+	/** Order meta key: set to "yes" to mark an order as a test order that must never be reported. */
+	const TEST_ORDER_META_KEY = '_pat_ga4_test_order';
+
+	/** Line item meta set by pat-free-bonus on its auto-added $0 bonus lines. */
+	const FREE_BONUS_ITEM_META = '_pat_free_bonus_item';
+
+	/** Roles whose own orders and browsing count as internal traffic. */
+	const INTERNAL_ROLES = array( 'administrator', 'shop_manager' );
 
 	/** Order meta key: the GA4 client_id attributed to this order. */
 	const CLIENT_ID_META_KEY = '_ga4_client_id';
@@ -49,6 +70,12 @@ final class PAT_GA4_Server_Tracking {
 		// first wins and the de-dup meta stops the other from sending it twice.
 		add_action( 'woocommerce_payment_complete', array( __CLASS__, 'handle_payment_complete' ) );
 		add_action( 'woocommerce_order_status_changed', array( __CLASS__, 'handle_status_changed' ), 10, 4 );
+
+		// Browser side: stop the official "Google Analytics for WooCommerce" plugin's gtag
+		// from reporting non-production hosts and internal users into the live property.
+		// (That plugin already skips users with manage_options; this adds shop managers,
+		// internal emails, and every non-production host.)
+		add_filter( 'woocommerce_ga_disable_tracking', array( __CLASS__, 'filter_disable_browser_tracking' ) );
 
 		// Settings screen (Settings > GA4 Server Tracking).
 		add_action( 'admin_menu', array( __CLASS__, 'register_settings_page' ) );
@@ -113,11 +140,75 @@ final class PAT_GA4_Server_Tracking {
 			return;
 		}
 
-		if ( $order->get_meta( self::SENT_META_KEY ) ) {
-			return; // Already sent successfully; never double-count.
+		if ( $order->get_meta( self::SENT_META_KEY ) || $order->get_meta( self::SKIPPED_META_KEY ) ) {
+			return; // Already sent (or deliberately skipped); never double-count.
+		}
+
+		$internal_reason = self::get_internal_order_reason( $order );
+
+		if ( '' !== $internal_reason ) {
+			$order->update_meta_data( self::SKIPPED_META_KEY, $internal_reason );
+			$order->save();
+			self::log( 'info', sprintf( 'Order #%d: not sent to GA4 - internal/test order (%s).', $order->get_id(), $internal_reason ) );
+			return;
 		}
 
 		self::send_purchase_event( $order, self::is_debug_mode(), false );
+	}
+
+	/**
+	 * Explains why an order counts as internal/test traffic, or '' if it's a real customer order.
+	 *
+	 * @param WC_Order $order
+	 * @return string
+	 */
+	public static function get_internal_order_reason( WC_Order $order ) {
+		if ( 'yes' === $order->get_meta( self::TEST_ORDER_META_KEY ) ) {
+			return 'flagged as test order';
+		}
+
+		if ( ! self::is_internal_exclusion_enabled() ) {
+			return '';
+		}
+
+		$user = $order->get_user();
+
+		if ( $user ) {
+			$roles = array_intersect( self::INTERNAL_ROLES, (array) $user->roles );
+
+			if ( $roles ) {
+				return 'customer has role ' . implode( ', ', $roles );
+			}
+		}
+
+		$email = strtolower( (string) $order->get_billing_email() );
+
+		if ( '' !== $email && in_array( $email, self::get_internal_emails(), true ) ) {
+			return 'billing email is on the internal list';
+		}
+
+		return '';
+	}
+
+	/**
+	 * Browser gtag kill-switch for non-production hosts and internal users.
+	 *
+	 * @param bool $disabled
+	 * @return bool
+	 */
+	public static function filter_disable_browser_tracking( $disabled ) {
+		if ( $disabled || ! self::is_production_site() ) {
+			return true;
+		}
+
+		if ( ! self::is_internal_exclusion_enabled() || ! is_user_logged_in() ) {
+			return false;
+		}
+
+		$user = wp_get_current_user();
+
+		return (bool) array_intersect( self::INTERNAL_ROLES, (array) $user->roles )
+			|| in_array( strtolower( $user->user_email ), self::get_internal_emails(), true );
 	}
 
 	/* -----------------------------------------------------------------------
@@ -151,9 +242,31 @@ final class PAT_GA4_Server_Tracking {
 			return new WP_Error( 'ga4_missing_secret', $message );
 		}
 
-		$client_id  = self::get_or_create_client_id( $order );
-		$session_id = self::get_session_id( $order );
-		$payload    = self::build_payload( $order, $client_id, $session_id, $tag_debug_view );
+		// Hard guard: only the production host may ever reach the live endpoint.
+		$forced_validate = ! $validate && ! self::is_production_site();
+
+		if ( $forced_validate ) {
+			$validate = true;
+		}
+
+		$events = self::build_events( $order, self::get_session_id( $order ), $tag_debug_view );
+
+		if ( empty( $events ) ) {
+			// Nothing reportable (e.g. only $0 free-bonus lines). Remember that so the
+			// status-change backstop doesn't re-evaluate it on every transition.
+			if ( ! $validate ) {
+				$order->update_meta_data( self::SKIPPED_META_KEY, 'no reportable items' );
+				$order->save();
+			}
+			self::log( 'info', sprintf( 'Order #%d: no reportable items; nothing sent to GA4.', $order->get_id() ) );
+			return new WP_Error( 'ga4_nothing_to_send', 'Order has no paid or trial items to report.' );
+		}
+
+		$client_id = self::get_or_create_client_id( $order );
+		$payload   = array(
+			'client_id' => $client_id,
+			'events'    => $events,
+		);
 
 		$endpoint = $validate
 			? 'https://www.google-analytics.com/debug/mp/collect'
@@ -193,10 +306,16 @@ final class PAT_GA4_Server_Tracking {
 			// validationMessages (an empty array means the payload is well-formed).
 			self::log(
 				'info',
-				sprintf( 'Order #%d: validation response (HTTP %d): %s', $order->get_id(), $code, $body ),
+				sprintf(
+					'Order #%d: %svalidation response (HTTP %d): %s',
+					$order->get_id(),
+					$forced_validate ? 'non-production host, so sent to the validation endpoint only (nothing recorded in GA4) - ' : '',
+					$code,
+					$body
+				),
 				array( 'payload' => $payload )
 			);
-			return array( 'code' => $code, 'body' => $body );
+			return array( 'code' => $code, 'body' => $body, 'payload' => $payload );
 		}
 
 		if ( $code < 200 || $code >= 300 ) {
@@ -218,76 +337,275 @@ final class PAT_GA4_Server_Tracking {
 		self::log(
 			'info',
 			sprintf(
-				'Order #%d: purchase event sent (client_id %s, session_id %s, value %s %s).',
+				'Order #%d: sent %s (client_id %s, session_id %s, order total %s %s).',
 				$order->get_id(),
+				implode( ', ', wp_list_pluck( $events, 'name' ) ),
 				$client_id,
-				$session_id ? $session_id : '(none)',
+				self::get_session_id( $order ) ? self::get_session_id( $order ) : '(none)',
 				$order->get_total(),
 				$order->get_currency()
-			)
+			),
+			array( 'payload' => $payload )
 		);
 
 		return true;
 	}
 
 	/**
-	 * Builds the Measurement Protocol JSON payload for an order.
+	 * Builds the Measurement Protocol events for an order:
+	 *  - purchase:        paid line items only (trial and $0 free-bonus lines excluded), value = order total.
+	 *  - start_trial:     "- Free Trial" line items, value 0. Sent instead of purchase for trial-only orders
+	 *                     so $0 trials stop inflating purchase counts/conversion rate.
+	 *  - trial_converted: one per paid item whose product this customer previously trialled.
+	 *
+	 * item_id follows the official GA for WooCommerce plugin's "ga_product_identifier" setting
+	 * (product ID on this site) so browser-side view_item/add_to_cart and these server-side
+	 * events join on the same item in GA4 reports.
 	 *
 	 * @param WC_Order $order
-	 * @param string   $client_id
 	 * @param string   $session_id
 	 * @param bool     $tag_debug_view
-	 * @return array
+	 * @return array[] Empty if there is nothing reportable.
 	 */
-	private static function build_payload( WC_Order $order, $client_id, $session_id, $tag_debug_view = false ) {
-		$items = array();
+	private static function build_events( WC_Order $order, $session_id, $tag_debug_view = false ) {
+		$paid   = array();
+		$trials = array();
 
 		foreach ( $order->get_items() as $item ) {
-			if ( ! $item instanceof WC_Order_Item_Product ) {
+			if ( ! $item instanceof WC_Order_Item_Product || self::is_free_bonus_item( $item ) ) {
 				continue;
 			}
 
-			$product = $item->get_product();
-			$sku     = $product ? $product->get_sku() : '';
-			$qty     = max( 1, (int) $item->get_quantity() );
-
-			$items[] = array(
-				'item_id'   => $sku ? $sku : (string) $item->get_product_id(),
-				'item_name' => $item->get_name(),
-				'price'     => round( (float) $item->get_total() / $qty, 2 ),
-				'quantity'  => $qty,
-			);
+			if ( self::is_trial_item( $item ) ) {
+				$trials[] = $item;
+			} else {
+				$paid[] = $item;
+			}
 		}
 
-		$params = array(
-			'transaction_id' => (string) $order->get_id(),
-			'value'          => (float) $order->get_total(),
-			'currency'       => $order->get_currency(),
-			'items'          => $items,
-		);
+		$common = array( 'currency' => $order->get_currency() );
 
 		if ( $session_id ) {
 			// Ties this Measurement Protocol hit to the visitor's actual browser session.
 			// Without session_id, GA4 has no session to attach source/medium to and the
 			// purchase revenue lands under "Unassigned" / "(not set)" landing page even
 			// though client_id is valid - this was the root cause of that symptom.
-			$params['session_id']           = $session_id;
-			$params['engagement_time_msec'] = 1;
+			$common['session_id']           = $session_id;
+			$common['engagement_time_msec'] = 1;
 		}
 
 		if ( $tag_debug_view ) {
-			$params['debug_mode'] = true;
+			$common['debug_mode'] = true;
 		}
 
-		return array(
-			'client_id' => $client_id,
-			'events'    => array(
-				array(
-					'name'   => 'purchase',
-					'params' => $params,
+		$events = array();
+
+		if ( $paid ) {
+			$events[] = array(
+				'name'   => 'purchase',
+				'params' => array_merge(
+					$common,
+					array(
+						'transaction_id' => (string) $order->get_id(),
+						'value'          => (float) $order->get_total(),
+						'items'          => array_map( array( __CLASS__, 'build_item' ), $paid ),
+					)
 				),
-			),
+			);
+		}
+
+		if ( $trials ) {
+			$events[] = array(
+				'name'   => 'start_trial',
+				'params' => array_merge(
+					$common,
+					array(
+						'transaction_id' => (string) $order->get_id(),
+						'value'          => 0,
+						'trial_product'  => implode( ', ', array_map( array( __CLASS__, 'get_trial_base_name' ), $trials ) ),
+						'items'          => array_map( array( __CLASS__, 'build_item' ), $trials ),
+					)
+				),
+			);
+		}
+
+		foreach ( $paid as $item ) {
+			$trial = self::find_prior_trial( $order, $item );
+
+			if ( ! $trial ) {
+				continue;
+			}
+
+			$built    = self::build_item( $item );
+			$events[] = array(
+				'name'   => 'trial_converted',
+				'params' => array_merge(
+					$common,
+					array(
+						'transaction_id'  => (string) $order->get_id(),
+						'value'           => $built['price'] * $built['quantity'],
+						'trial_product'   => $trial['base_name'],
+						'trial_order_id'  => (string) $trial['order_id'],
+						'days_to_convert' => $trial['days'],
+						'items'           => array( $built ),
+					)
+				),
+			);
+		}
+
+		return $events;
+	}
+
+	/**
+	 * @param WC_Order_Item_Product $item
+	 * @return array GA4 item.
+	 */
+	private static function build_item( WC_Order_Item_Product $item ) {
+		$product    = $item->get_product();
+		$product_id = (int) $item->get_product_id(); // Parent ID for variations, matching the browser plugin.
+		$item_id    = (string) $product_id;
+		$settings   = get_option( 'woocommerce_google_analytics_settings', array() );
+
+		if ( $product && isset( $settings['ga_product_identifier'] ) && 'product_sku' === $settings['ga_product_identifier'] ) {
+			$item_id = $product->get_sku() ? $product->get_sku() : '#' . $product_id;
+		}
+
+		$qty = max( 1, (int) $item->get_quantity() );
+
+		return array(
+			'item_id'   => $item_id,
+			'item_name' => $item->get_name(),
+			'price'     => round( (float) $item->get_total() / $qty, 2 ),
+			'quantity'  => $qty,
 		);
+	}
+
+	/**
+	 * @param WC_Order_Item_Product $item
+	 * @return bool
+	 */
+	private static function is_free_bonus_item( WC_Order_Item_Product $item ) {
+		return 'yes' === $item->get_meta( self::FREE_BONUS_ITEM_META )
+			|| ( 0.0 === (float) $item->get_total() && preg_match( '/\(Free bonus\)\s*$/i', $item->get_name() ) );
+	}
+
+	/**
+	 * Trial products are separate $0 products named "<Product> - Free Trial".
+	 *
+	 * @param WC_Order_Item_Product $item
+	 * @return bool
+	 */
+	private static function is_trial_item( WC_Order_Item_Product $item ) {
+		return 0.0 === (float) $item->get_total() && (bool) preg_match( '/\s-\s*Free Trial\s*$/i', $item->get_name() );
+	}
+
+	/**
+	 * "Advanced Second Entry - Free Trial" => "Advanced Second Entry".
+	 *
+	 * @param WC_Order_Item_Product $item
+	 * @return string
+	 */
+	private static function get_trial_base_name( WC_Order_Item_Product $item ) {
+		return trim( preg_replace( '/\s-\s*Free Trial\s*$/i', '', $item->get_name() ) );
+	}
+
+	/**
+	 * Finds the most recent earlier paid-for (processing/completed) trial order by the same
+	 * customer (account or billing email) for the product in $paid_item.
+	 *
+	 * Trial and paid products are matched by name prefix because they're separate
+	 * products with no stored link, and names don't always match exactly
+	 * ("Advanced Second Entry - Free Trial" covers "Advanced Second Entry Strategy"
+	 * and "Advanced Second Entry Indicator").
+	 *
+	 * @param WC_Order              $order
+	 * @param WC_Order_Item_Product $paid_item
+	 * @return array{order_id: int, base_name: string, days: int}|null
+	 */
+	private static function find_prior_trial( WC_Order $order, WC_Order_Item_Product $paid_item ) {
+		$paid_name = strtolower( $paid_item->get_name() );
+
+		foreach ( self::get_prior_trial_items( $order ) as $trial ) {
+			$base = strtolower( $trial['base_name'] );
+
+			$matches = '' !== $base && 0 === strpos( $paid_name, $base );
+
+			/**
+			 * Filters whether a previously trialled product counts as converted by a paid line item.
+			 *
+			 * @param bool                  $matches
+			 * @param array                 $trial     order_id, base_name, days.
+			 * @param WC_Order_Item_Product $paid_item
+			 */
+			if ( apply_filters( 'pat_ga4_trial_matches_paid_item', $matches, $trial, $paid_item ) ) {
+				return $trial;
+			}
+		}
+
+		return null;
+	}
+
+	/**
+	 * @param WC_Order $order
+	 * @return array[] Newest first.
+	 */
+	private static function get_prior_trial_items( WC_Order $order ) {
+		static $cache = array();
+
+		if ( isset( $cache[ $order->get_id() ] ) ) {
+			return $cache[ $order->get_id() ];
+		}
+
+		$created = $order->get_date_created();
+		$base    = array(
+			'limit'        => 50,
+			'status'       => array( 'wc-processing', 'wc-completed' ),
+			'exclude'      => array( $order->get_id() ),
+			'orderby'      => 'date',
+			'order'        => 'DESC',
+			'date_created' => '<' . ( $created ? $created->getTimestamp() : time() ),
+		);
+		$orders  = array();
+
+		if ( $order->get_customer_id() ) {
+			$orders = wc_get_orders( array_merge( $base, array( 'customer_id' => $order->get_customer_id() ) ) );
+		}
+
+		if ( $order->get_billing_email() ) {
+			$orders = array_merge( $orders, wc_get_orders( array_merge( $base, array( 'billing_email' => $order->get_billing_email() ) ) ) );
+		}
+
+		usort(
+			$orders,
+			function ( $a, $b ) {
+				return $b->get_date_created()->getTimestamp() - $a->get_date_created()->getTimestamp();
+			}
+		);
+
+		$trials = array();
+		$seen   = array();
+		$now    = $created ? $created->getTimestamp() : time();
+
+		foreach ( $orders as $prior ) {
+			if ( isset( $seen[ $prior->get_id() ] ) ) {
+				continue;
+			}
+			$seen[ $prior->get_id() ] = true;
+
+			foreach ( $prior->get_items() as $item ) {
+				if ( $item instanceof WC_Order_Item_Product && self::is_trial_item( $item ) ) {
+					$trials[] = array(
+						'order_id'  => $prior->get_id(),
+						'base_name' => self::get_trial_base_name( $item ),
+						'days'      => (int) floor( ( $now - $prior->get_date_created()->getTimestamp() ) / DAY_IN_SECONDS ),
+					);
+				}
+			}
+		}
+
+		$cache[ $order->get_id() ] = $trials;
+
+		return $trials;
 	}
 
 	/* -----------------------------------------------------------------------
@@ -492,6 +810,38 @@ final class PAT_GA4_Server_Tracking {
 		return ! empty( $opts['debug_mode'] );
 	}
 
+	/**
+	 * True only on the real production host. Everything else (Local, staging, clones) can
+	 * only ever hit the validation endpoint, whatever secret/debug settings it carries.
+	 *
+	 * @return bool
+	 */
+	public static function is_production_site() {
+		$host = strtolower( (string) wp_parse_url( home_url(), PHP_URL_HOST ) );
+
+		return (bool) apply_filters( 'pat_ga4_is_production_site', in_array( $host, self::PRODUCTION_HOSTS, true ), $host );
+	}
+
+	/**
+	 * On by default: internal users' orders/browsing are not reported.
+	 *
+	 * @return bool
+	 */
+	public static function is_internal_exclusion_enabled() {
+		$opts = get_option( self::OPTION_KEY, array() );
+
+		return ! isset( $opts['exclude_internal'] ) || ! empty( $opts['exclude_internal'] );
+	}
+
+	/**
+	 * @return string[] Lowercased.
+	 */
+	public static function get_internal_emails() {
+		$opts = get_option( self::OPTION_KEY, array() );
+
+		return empty( $opts['internal_emails'] ) ? array() : array_filter( array_map( 'strtolower', explode( "\n", $opts['internal_emails'] ) ) );
+	}
+
 	/* -----------------------------------------------------------------------
 	 * Settings page (Settings > GA4 Server Tracking)
 	 * ------------------------------------------------------------------- */
@@ -516,10 +866,22 @@ final class PAT_GA4_Server_Tracking {
 	 */
 	public static function sanitize_settings( $input ) {
 		return array(
-			'measurement_id' => isset( $input['measurement_id'] ) ? sanitize_text_field( $input['measurement_id'] ) : '',
-			'api_secret'     => isset( $input['api_secret'] ) ? sanitize_text_field( $input['api_secret'] ) : '',
-			'debug_mode'     => ! empty( $input['debug_mode'] ),
+			'measurement_id'   => isset( $input['measurement_id'] ) ? sanitize_text_field( $input['measurement_id'] ) : '',
+			'api_secret'       => isset( $input['api_secret'] ) ? sanitize_text_field( $input['api_secret'] ) : '',
+			'debug_mode'       => ! empty( $input['debug_mode'] ),
+			'exclude_internal' => ! empty( $input['exclude_internal'] ),
+			'internal_emails'  => isset( $input['internal_emails'] ) ? self::sanitize_email_list( $input['internal_emails'] ) : '',
 		);
+	}
+
+	/**
+	 * @param string $raw Comma/newline/space-separated emails.
+	 * @return string One valid, lowercased email per line.
+	 */
+	private static function sanitize_email_list( $raw ) {
+		$emails = array_filter( array_map( 'sanitize_email', preg_split( '/[\s,;]+/', strtolower( (string) $raw ) ) ), 'is_email' );
+
+		return implode( "\n", array_unique( $emails ) );
 	}
 
 	public static function render_settings_page() {
@@ -546,10 +908,23 @@ final class PAT_GA4_Server_Tracking {
 						<td>
 							<?php if ( $secret_is_constant ) : ?>
 								<?php esc_html_e( 'Configured via the GA4_MP_API_SECRET constant in wp-config.php.', 'pat-ga4' ); ?>
+								<?php if ( ! empty( $opts['api_secret'] ) ) : ?>
+									<br /><span style="color:#b32d2e;"><?php esc_html_e( 'An old copy is still stored in the database - click "Save Changes" below to remove it.', 'pat-ga4' ); ?></span>
+								<?php endif; ?>
 							<?php elseif ( self::get_api_secret() ) : ?>
 								<?php esc_html_e( 'Configured via the option field below.', 'pat-ga4' ); ?>
 							<?php else : ?>
 								<span style="color:#b32d2e;"><?php esc_html_e( 'Not configured yet - purchase events cannot be sent until this is set.', 'pat-ga4' ); ?></span>
+							<?php endif; ?>
+						</td>
+					</tr>
+					<tr>
+						<td><strong><?php esc_html_e( 'Environment', 'pat-ga4' ); ?></strong></td>
+						<td>
+							<?php if ( self::is_production_site() ) : ?>
+								<?php esc_html_e( 'Production host - automatic sends go to live GA4 (unless debug mode is on).', 'pat-ga4' ); ?>
+							<?php else : ?>
+								<span style="color:#b32d2e;"><?php esc_html_e( 'Non-production host - all sends are forced to the validation endpoint and browser gtag is disabled. Nothing reaches GA4 reports from this site.', 'pat-ga4' ); ?></span>
 							<?php endif; ?>
 						</td>
 					</tr>
@@ -585,7 +960,8 @@ final class PAT_GA4_Server_Tracking {
 						</td>
 					</tr>
 					<?php else : ?>
-						<input type="hidden" name="<?php echo esc_attr( self::OPTION_KEY ); ?>[api_secret]" value="<?php echo esc_attr( $opts['api_secret'] ?? '' ); ?>" />
+						<?php // The constant wins, so saving here drops any leftover DB copy of the secret (keeps DB clones secret-free). ?>
+						<input type="hidden" name="<?php echo esc_attr( self::OPTION_KEY ); ?>[api_secret]" value="" />
 					<?php endif; ?>
 					<tr>
 						<th scope="row"><?php esc_html_e( 'Debug mode', 'pat-ga4' ); ?></th>
@@ -594,6 +970,22 @@ final class PAT_GA4_Server_Tracking {
 								<input type="checkbox" name="<?php echo esc_attr( self::OPTION_KEY ); ?>[debug_mode]" value="1" <?php checked( ! empty( $opts['debug_mode'] ) ); ?> />
 								<?php esc_html_e( 'Send automatic purchase events to the /debug/mp/collect validation endpoint instead of live GA4 (nothing is recorded; use only on staging).', 'pat-ga4' ); ?>
 							</label>
+						</td>
+					</tr>
+					<tr>
+						<th scope="row"><?php esc_html_e( 'Exclude internal traffic', 'pat-ga4' ); ?></th>
+						<td>
+							<label>
+								<input type="checkbox" name="<?php echo esc_attr( self::OPTION_KEY ); ?>[exclude_internal]" value="1" <?php checked( self::is_internal_exclusion_enabled() ); ?> />
+								<?php esc_html_e( 'Don\'t report orders placed by administrators/shop managers or by the emails below, and disable browser gtag for them while logged in.', 'pat-ga4' ); ?>
+							</label>
+						</td>
+					</tr>
+					<tr>
+						<th scope="row"><label for="pat_ga4_internal_emails"><?php esc_html_e( 'Internal emails', 'pat-ga4' ); ?></label></th>
+						<td>
+							<textarea id="pat_ga4_internal_emails" name="<?php echo esc_attr( self::OPTION_KEY ); ?>[internal_emails]" rows="4" class="large-text code"><?php echo esc_textarea( $opts['internal_emails'] ?? '' ); ?></textarea>
+							<p class="description"><?php esc_html_e( 'One per line. Orders whose billing email matches (e.g. your own test-customer accounts) are never sent to GA4.', 'pat-ga4' ); ?></p>
 						</td>
 					</tr>
 				</table>
@@ -676,12 +1068,15 @@ final class PAT_GA4_Server_Tracking {
 		}
 
 		$sent_at = $order->get_meta( self::SENT_META_KEY );
+		$skipped = $order->get_meta( self::SKIPPED_META_KEY );
 
 		echo '<p class="form-field form-field-wide">';
 		echo '<strong>' . esc_html__( 'GA4 purchase event:', 'pat-ga4' ) . '</strong> ';
 
 		if ( $sent_at ) {
 			echo esc_html( sprintf( __( 'Sent %s', 'pat-ga4' ), $sent_at ) );
+		} elseif ( $skipped ) {
+			echo esc_html( sprintf( __( 'Not sent - %s.', 'pat-ga4' ), $skipped ) );
 		} else {
 			esc_html_e( 'Not sent yet. Use "Resend GA4 purchase event" under Order actions to send it now.', 'pat-ga4' );
 		}
@@ -730,7 +1125,10 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 	class PAT_GA4_Server_Tracking_CLI {
 
 		/**
-		 * (Re)sends the GA4 purchase event for a WooCommerce order.
+		 * (Re)sends the GA4 purchase/start_trial/trial_converted events for a WooCommerce order.
+		 *
+		 * Bypasses the internal-order exclusion (it's a deliberate send), but on any
+		 * non-production host it is always forced to the validation endpoint.
 		 *
 		 * ## OPTIONS
 		 *
@@ -774,8 +1172,10 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 				WP_CLI::error( $result->get_error_message() );
 			}
 
-			if ( $validate ) {
-				WP_CLI::success( "Validation response received for order #{$order_id}. See the ga4-server-tracking log (WooCommerce > Status > Logs) for validationMessages." );
+			if ( is_array( $result ) ) {
+				WP_CLI::log( wp_json_encode( $result['payload'], JSON_PRETTY_PRINT ) );
+				WP_CLI::log( 'Response: ' . $result['body'] );
+				WP_CLI::success( "Validation response received for order #{$order_id} (nothing recorded in GA4)." );
 			} else {
 				WP_CLI::success( "Purchase event sent for order #{$order_id}." );
 			}
