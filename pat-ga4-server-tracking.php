@@ -2,7 +2,7 @@
 /**
  * Plugin Name: PAT GA4 Server-Side Purchase Tracking
  * Description: Sends the GA4 "purchase" event via the Measurement Protocol directly from the server when an order completes, so ecommerce tracking no longer depends on the custom Oxygen/Breakdance checkout's thank-you page JavaScript executing. This is the sole purchase tracker (the official "Google Analytics for WooCommerce" plugin's "Purchase Transactions" setting is disabled to avoid double-counting) - it still handles page views, add-to-cart, add_shipping_info/add_payment_info, etc., all of which already work correctly on this site's classic checkout shortcode.
- * Version: 1.2.0
+ * Version: 1.2.1
  * Author: Price Action Tools
  * License: GPL-2.0-or-later
  * Requires Plugins: woocommerce
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 final class PAT_GA4_Server_Tracking {
 
-	const VERSION = '1.2.0';
+	const VERSION = '1.2.1';
 
 	/**
 	 * Hosts allowed to send to the live /mp/collect endpoint. Anywhere else (Local,
@@ -377,7 +377,11 @@ final class PAT_GA4_Server_Tracking {
 			}
 
 			if ( self::is_trial_item( $item ) ) {
-				$trials[] = $item;
+				// Customers sometimes re-checkout a trial as a guest instead of logging in to
+				// re-download it; only their first trial of a product counts as a start_trial.
+				if ( ! self::is_repeat_trial( $order, $item ) ) {
+					$trials[] = $item;
+				}
 			} else {
 				$paid[] = $item;
 			}
@@ -507,6 +511,30 @@ final class PAT_GA4_Server_Tracking {
 	 */
 	private static function get_trial_base_name( WC_Order_Item_Product $item ) {
 		return trim( preg_replace( '/\s-\s*Free Trial\s*$/i', '', $item->get_name() ) );
+	}
+
+	/**
+	 * Whether this customer (account or billing email) already had an earlier
+	 * trial order for the same product.
+	 *
+	 * @param WC_Order              $order
+	 * @param WC_Order_Item_Product $trial_item
+	 * @return bool
+	 */
+	private static function is_repeat_trial( WC_Order $order, WC_Order_Item_Product $trial_item ) {
+		$base = strtolower( self::get_trial_base_name( $trial_item ) );
+
+		foreach ( self::get_prior_trial_items( $order ) as $trial ) {
+			if ( strtolower( $trial['base_name'] ) === $base ) {
+				self::log(
+					'info',
+					sprintf( 'Order #%d: repeat trial of %s (first trial order #%d); start_trial not sent.', $order->get_id(), $trial['base_name'], $trial['order_id'] )
+				);
+				return true;
+			}
+		}
+
+		return false;
 	}
 
 	/**
