@@ -2,7 +2,7 @@
 /**
  * Plugin Name: PAT GA4 Server-Side Purchase Tracking
  * Description: Sends the GA4 "purchase" event via the Measurement Protocol directly from the server when an order completes, so ecommerce tracking no longer depends on the custom Oxygen/Breakdance checkout's thank-you page JavaScript executing. This is the sole purchase tracker (the official "Google Analytics for WooCommerce" plugin's "Purchase Transactions" setting is disabled to avoid double-counting) - it still handles page views, add-to-cart, add_shipping_info/add_payment_info, etc., all of which already work correctly on this site's classic checkout shortcode.
- * Version: 1.2.1
+ * Version: 1.2.2
  * Author: Price Action Tools
  * License: GPL-2.0-or-later
  * Requires Plugins: woocommerce
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 final class PAT_GA4_Server_Tracking {
 
-	const VERSION = '1.2.1';
+	const VERSION = '1.2.2';
 
 	/**
 	 * Hosts allowed to send to the live /mp/collect endpoint. Anywhere else (Local,
@@ -183,7 +183,7 @@ final class PAT_GA4_Server_Tracking {
 
 		$email = strtolower( (string) $order->get_billing_email() );
 
-		if ( '' !== $email && in_array( $email, self::get_internal_emails(), true ) ) {
+		if ( self::is_internal_email( $email ) ) {
 			return 'billing email is on the internal list';
 		}
 
@@ -208,7 +208,7 @@ final class PAT_GA4_Server_Tracking {
 		$user = wp_get_current_user();
 
 		return (bool) array_intersect( self::INTERNAL_ROLES, (array) $user->roles )
-			|| in_array( strtolower( $user->user_email ), self::get_internal_emails(), true );
+			|| self::is_internal_email( $user->user_email );
 	}
 
 	/* -----------------------------------------------------------------------
@@ -862,12 +862,31 @@ final class PAT_GA4_Server_Tracking {
 	}
 
 	/**
-	 * @return string[] Lowercased.
+	 * @return string[] Lowercased emails and "@domain" entries.
 	 */
 	public static function get_internal_emails() {
 		$opts = get_option( self::OPTION_KEY, array() );
 
 		return empty( $opts['internal_emails'] ) ? array() : array_filter( array_map( 'strtolower', explode( "\n", $opts['internal_emails'] ) ) );
+	}
+
+	/**
+	 * Whether an email is on the internal list, either exactly or via an "@domain" entry.
+	 *
+	 * @param string $email
+	 * @return bool
+	 */
+	public static function is_internal_email( $email ) {
+		$email = strtolower( trim( (string) $email ) );
+		$at    = strrpos( $email, '@' );
+
+		if ( '' === $email || false === $at ) {
+			return false;
+		}
+
+		$list = self::get_internal_emails();
+
+		return in_array( $email, $list, true ) || in_array( substr( $email, $at ), $list, true );
 	}
 
 	/* -----------------------------------------------------------------------
@@ -903,13 +922,35 @@ final class PAT_GA4_Server_Tracking {
 	}
 
 	/**
-	 * @param string $raw Comma/newline/space-separated emails.
-	 * @return string One valid, lowercased email per line.
+	 * @param string $raw Comma/newline/space-separated emails and/or domains.
+	 * @return string One lowercased entry per line: a valid email, or a domain stored as "@domain".
 	 */
 	private static function sanitize_email_list( $raw ) {
-		$emails = array_filter( array_map( 'sanitize_email', preg_split( '/[\s,;]+/', strtolower( (string) $raw ) ) ), 'is_email' );
+		$entries = array();
 
-		return implode( "\n", array_unique( $emails ) );
+		foreach ( preg_split( '/[\s,;]+/', strtolower( (string) $raw ) ) as $entry ) {
+			$entry = trim( $entry );
+
+			if ( '' === $entry ) {
+				continue;
+			}
+
+			if ( false !== strpos( ltrim( $entry, '@' ), '@' ) ) {
+				$email = sanitize_email( $entry );
+
+				if ( is_email( $email ) ) {
+					$entries[] = $email;
+				}
+			} else {
+				$domain = ltrim( $entry, '@' );
+
+				if ( preg_match( '/^[a-z0-9-]+(\.[a-z0-9-]+)+$/', $domain ) ) {
+					$entries[] = '@' . $domain;
+				}
+			}
+		}
+
+		return implode( "\n", array_unique( $entries ) );
 	}
 
 	public static function render_settings_page() {
@@ -1013,7 +1054,7 @@ final class PAT_GA4_Server_Tracking {
 						<th scope="row"><label for="pat_ga4_internal_emails"><?php esc_html_e( 'Internal emails', 'pat-ga4' ); ?></label></th>
 						<td>
 							<textarea id="pat_ga4_internal_emails" name="<?php echo esc_attr( self::OPTION_KEY ); ?>[internal_emails]" rows="4" class="large-text code"><?php echo esc_textarea( $opts['internal_emails'] ?? '' ); ?></textarea>
-							<p class="description"><?php esc_html_e( 'One per line. Orders whose billing email matches (e.g. your own test-customer accounts) are never sent to GA4.', 'pat-ga4' ); ?></p>
+							<p class="description"><?php esc_html_e( 'One per line: a full email, or a whole domain (e.g. @example.com). Orders whose billing email matches (e.g. your own test-customer accounts) are never sent to GA4.', 'pat-ga4' ); ?></p>
 						</td>
 					</tr>
 				</table>
